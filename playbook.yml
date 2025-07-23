@@ -1,30 +1,120 @@
 ---
-- name: demoplaybook setup
-  hosts: webservers
-  become: yes
+# 1. Inventory Section — creates hosts and groups
+- hosts: localhost
+  gather_facts: false
   tasks:
-    - name: Install httpd
-      ansible.builtin.yum: 
-        name: httpd
+    - name: Define demoall hosts
+      add_host:
+        name: "{{ item.name }}"
+        groups: "{{ item.group }}"
+        ansible_host: "{{ item.ansible_host }}"
+        ansible_user: "{{ item.ansible_user }}"
+        ansible_ssh_private_key_file: "{{ item.ansible_ssh_private_key_file }}"
+      loop:
+        - { name: demoweb01, group: webservers:demoall, ansible_host: 172.31.4.46, ansible_user: ec2-user, ansible_ssh_private_key_file: demouserkey.pem }
+        - { name: demoweb02, group: webservers:demoall, ansible_host: 172.31.5.104, ansible_user: ec2-user, ansible_ssh_private_key_file: demouserkey.pem }
+        - { name: demodb01 , group: dbservers:demoall , ansible_host: 172.31.11.147, ansible_user: ec2-user, ansible_ssh_private_key_file: demouserkey.pem }
+
+# 2. Setup playbook section — runs across demoall
+- name: Setup Web and DB servers
+  hosts: demoall
+  become: yes
+  collections:
+    - community.mysql
+
+  vars:
+    db_appuser_password: "{{ lookup('password', '/dev/null length=20 chars=ascii_letters') }}"
+    app_db_name: myappdb
+    app_user: appuser
+    web_hosts:
+      - demoweb01
+      - demoweb02
+
+  tasks:
+    - name: Install Apache on webservers
+      when: "'webservers' in group_names"
+      apt:
+        name: apache2
+        update_cache: yes
         state: present
 
-    - name: Start service
-      ansible.builtin.service:
-        name: httpd
+    - name: Start & enable Apache
+      when: "'webservers' in group_names"
+      service:
+        name: apache2
         state: started
-        enabled: yes 
+        enabled: yes
 
-- name: DBserver setup
-  hosts: dbservers
-  become: yes
-  tasks:
-    - name: Install mariadb-server
-      ansible.builtin.yum:
+    - name: Install MariaDB on dbservers
+      when: "'dbservers' in group_names"
+      apt:
         name: mariadb-server
+        update_cache: yes
         state: present
 
-    - name: Start mariadb service
-      ansible.builtin.service:
+    - name: Start & enable MariaDB
+      when: "'dbservers' in group_names"
+      service:
         name: mariadb
         state: started
         enabled: yes
+
+    - name: Allow remote DB connections
+      when: "'dbservers' in group_names"
+      lineinfile:
+        path: /etc/mysql/mariadb.conf.d/50-server.cnf
+        regexp: '^bind-address'
+        line: 'bind-address = 0.0.0.0'
+      notify: Restart MariaDB
+
+    - name: Remove anonymous users
+      when: "'dbservers' in group_names"
+      community.mysql.mysql_user:
+        name: ''
+        host_all: true
+        state: absent
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+
+    - name: Remove test database
+      when: "'dbservers' in group_names"
+      community.mysql.mysql_db:
+        name: test
+        state: absent
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+
+    - name: Create application database
+      when: "'dbservers' in group_names"
+      community.mysql.mysql_db:
+        name: "{{ app_db_name }}"
+        state: present
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+
+    - name: Create limited DB user for webservers
+      when: "'dbservers' in group_names"
+      community.mysql.mysql_user:
+        name: "{{ app_user }}"
+        host: "{{ hostvars[item].ansible_host }}"
+        password: "{{ db_appuser_password }}"
+        priv: "{{ app_db_name }}.*:SELECT,INSERT,UPDATE,DELETE"
+        state: present
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+      loop: "{{ web_hosts }}"
+
+    - name: Verify MariaDB version (connectivity test)
+      when: "'dbservers' in group_names"
+      community.mysql.mysql_info:
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+        filter:
+          - version
+      register: mariadb_info
+
+    - name: Show DB version for confirmation
+      when: "'dbservers' in group_names"
+      debug:
+        msg: "MariaDB version: {{ mariadb_info.version }}"
+
+  handlers:
+    - name: Restart MariaDB
+      service:
+        name: mariadb
+        state: restarted
